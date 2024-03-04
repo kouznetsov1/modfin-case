@@ -9,7 +9,7 @@ services:
       - HOSTNAME=web-sub-client
       - PORT=8080
       - HUB_URL=http://hub:8080
-      - TOPIC=oilprice
+      - TOPIC=oil-price
 
   hub:
     build:

@@ -1,4 +1,4 @@
-FROM golang:1.18
+FROM golang:1.22
 
 RUN go install -v github.com/codeskyblue/fswatch@latest
 

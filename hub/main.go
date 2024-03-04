@@ -3,30 +3,47 @@ package main
 import (
 	"bytes"
 	"client/model"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
+	"client/store"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
-var subscriptions []model.Subscription
+var LEASE_SECONDS = 60 * 60 * 24 * 10
+
+// This and the ticker kind of emulates a publisher
+var topics = store.NewTopicStore()
 
 func main() {
-	http.HandleFunc("/", handleSubscribe)
+	subscriptions := store.NewSubscriptionStore()
+	topic := "oil-price"
+	topics.AddTopic(topic)
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			subscribe(w, r, subscriptions)
+		} else {
+			http.Error(w, "Only POST method is supported", http.StatusMethodNotAllowed)
+		}
+	})
 
 	// Start a ticker to notify subscribers every 10 seconds
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
-		for {
-			select {
-			case <-ticker.C:
-				notifySubscribers()
-			}
+		for range ticker.C {
+			notifySubscribers(&topic, subscriptions)
+		}
+	}()
+
+	// Remove outdated subscriptions every 10 minutes
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		for range ticker.C {
+			subscriptions.RemoveOutdatedSubscriptions()
 		}
 	}()
 
@@ -40,18 +57,50 @@ func main() {
 }
 
 // Handles a POST request from a subscriber to subscribe to a topic
-func handleSubscribe(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST method is supported", http.StatusMethodNotAllowed)
-		return
-	}
-
+func subscribe(w http.ResponseWriter, r *http.Request, ss *store.SubscriptionStore) {
 	err := r.ParseForm()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	// Confirm that the request has been made
+	fmt.Fprintf(w, `{"message": "Subscription request received and will be processed."}`)
+
+	sr, err := validateRequest(r)
+	if err != nil {
+		client := &http.Client{
+			Timeout: time.Second * 10, // Set timeout to 10 seconds
+		}
+
+		url := fmt.Sprintf("%s?hub.mode=denied&topic=%s&reason=%s", sr.Callback, sr.Topic, err.Error())
+
+		res, err := client.Get(url)
+		if err != nil {
+			fmt.Printf("Error making GET request: %v\n", err)
+			return
+		}
+		defer res.Body.Close()
+	} else {
+		// Check intent, if not 2xx status, return error
+		if err := verifyIntent(sr); err != nil {
+			fmt.Printf("Verification of intent failed: %s\n", err)
+			return
+		}
+
+		if sr.Mode == "subscribe" {
+			ss.AddSubscription(sr.Topic, sr.Callback, sr.Secret, sr.LeaseSeconds)
+		} else if sr.Mode == "unsubscribe" {
+			ss.RemoveSubscription(sr.Topic, sr.Callback)
+		} else {
+			http.Error(w, "Invalid mode", http.StatusBadRequest)
+			return
+		}
+	}
+
+}
+
+func validateRequest(r *http.Request) (model.SubscribeRequest, error) {
 	sr := model.SubscribeRequest{
 		Callback: r.FormValue("hub.callback"),
 		Mode:     r.FormValue("hub.mode"),
@@ -59,54 +108,82 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		Secret:   r.FormValue("hub.secret"),
 	}
 
-	// Generate string and check that subscriber echoes it back
-	// https://www.w3.org/TR/websub/#x5-3-hub-verifies-intent-of-the-subscriber
-	challenge := generateRandomString(16)
+	leaseSecondsStr := r.FormValue("hub.lease_seconds")
+	if leaseSecondsStr == "" {
+		sr.LeaseSeconds = LEASE_SECONDS // Default lease seconds if not provided.
+	} else {
+		var err error
+		sr.LeaseSeconds, err = strconv.Atoi(leaseSecondsStr)
+		if err != nil {
+			return model.SubscribeRequest{
+				Callback: sr.Callback,
+				Topic:    sr.Topic,
+			}, fmt.Errorf("invalid lease_seconds: %v", err)
+		}
+	}
+
+	if !topics.HasTopic(sr.Topic) {
+		return model.SubscribeRequest{
+			Callback: sr.Callback,
+			Topic:    sr.Topic,
+		}, fmt.Errorf("topic does not exist: %s", sr.Topic)
+	}
+
+	return sr, nil
+}
+
+// Generate string and check that subscriber echoes it back
+// https://www.w3.org/TR/websub/#x5-3-hub-verifies-intent-of-the-subscriber
+func verifyIntent(sr model.SubscribeRequest) error {
+	challenge, err := generateRandomString(16)
+	if err != nil {
+		return &model.VerificationError{Message: err.Error(), Code: 0}
+	}
+
 	verificationUrl := fmt.Sprintf("%s?hub.mode=%s&hub.topic=%s&hub.challenge=%s", sr.Callback, sr.Mode, sr.Topic, challenge)
 
-	res, err := http.Get(verificationUrl)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	// Set a timeout for outbound requests if the subscriber does not respond
+	client := &http.Client{
+		Timeout: 10 * time.Second,
 	}
 
+	res, err := client.Get(verificationUrl)
+	if err != nil {
+		return &model.VerificationError{Message: err.Error(), Code: 0}
+	}
 	defer res.Body.Close()
 
-	// Read body to check if subscriber echoed challenge
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return &model.VerificationError{Message: ("Failed to read response body"), Code: 0}
 	}
 
-	// If the response status code is not 200 or subscriber did not echo challenge, return an error
-	if res.StatusCode != http.StatusOK || string(b) != challenge {
-		http.Error(w, "Failed to verify intent of subscriber", http.StatusForbidden)
-		return
+	// If status is 2xx and subscriber echoed challenge
+	if res.StatusCode >= 200 && res.StatusCode < 300 && string(b) == challenge {
+		return nil
 	}
-
-	// Add to global list of subscriptions if mode is "subscribe"
-	if sr.Mode == "subscribe" {
-		subscriptions = append(subscriptions, model.Subscription{Callback: sr.Callback, Topic: sr.Topic, Secret: sr.Secret})
-	}
-
-	// Remove from global list of subscriptions if mode is "unsubscribe"
-	if sr.Mode == "unsubscribe" {
-		for i, sub := range subscriptions {
-			if sub.Callback == sr.Callback {
-				subscriptions = append(subscriptions[:i], subscriptions[i+1:]...)
-				break
-			}
-		}
+	return &model.VerificationError{
+		Message: "Subscriber did not echo the challenge correctly or returned a non-2xx status",
+		Code:    res.StatusCode,
 	}
 }
 
 // Sends a notification to all subscribers of a topic
-func notifySubscribers() {
-	b := []byte(fmt.Sprintf(`{"data": "some data", "date": "%s"}`, time.Now().Format("2006-01-02 12:12:12")))
+func notifySubscribers(topic *string, subscriptions *store.SubscriptionStore) {
+	// Data to send to subscribers
+	b := []byte(fmt.Sprintf(`{"data": "This is the topic that you're subscribed to: %s"}`, *topic))
 
-	for _, sub := range subscriptions {
-		// Sign the data
+	// Set a timeout for outbound requests if the subscriber does not respond
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	fmt.Print("Sending notification to subscribers\n")
+
+	// For all subscriptions of the given topic
+	s := subscriptions.GetSubscriptions(*topic)
+	for _, sub := range s {
+		// Sign the request and send it to the subscriber
 		hash := sign(sub, string(b))
 
 		req, err := http.NewRequest(http.MethodPost, sub.Callback, bytes.NewReader(b))
@@ -117,20 +194,11 @@ func notifySubscribers() {
 		req.Header.Set("X-Hub-Signature", fmt.Sprintf("sha256=%s", hash))
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			fmt.Printf("error sending notification: %s\n", err)
 			continue
 		}
 		resp.Body.Close()
 	}
-
-}
-
-// Generates a new HMAC signature for sending notification
-// Uses SHA256, secret as key and the request body as data
-func sign(s model.Subscription, b string) string {
-	hash := hmac.New(sha256.New, []byte(s.Secret))
-	hash.Write([]byte(b))
-	return hex.EncodeToString(hash.Sum(nil))
 }
